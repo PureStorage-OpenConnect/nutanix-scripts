@@ -1,6 +1,6 @@
 # Collect Nutanix VM vDisk and Map to Pure Storage Volumes and Snapshots
 
-[Blog Post](https://davidstamen.com/2025/08/16/collect-nutanix-vm-vdisk-and-map-to-pure-storage-volumes-and-snapshots/)
+[Blog Post](https://davidstamen.com/2025/12/16/collect-nutanix-vm-vdisk-and-map-to-pure-storage-volumes-and-snapshots/)
 
 Follow the below step to collect Azure VM data disk information.
 
