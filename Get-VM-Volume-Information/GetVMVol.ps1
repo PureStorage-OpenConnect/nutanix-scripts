@@ -1,37 +1,43 @@
 <#
     GetVMVol.ps1 -
-    Version:        1.0.2
+    Version:        2.0.0
     Author:         David Stamen @ Pure Storage
 .SYNOPSIS
     Map the Nutanix VM UUID and vDisks to Pure Storage Volumes
 .DESCRIPTION
     This script will review Pure Storage Volume Tags and provide the following:
     - VM Name (or VM UUID if name not found)
+    - Disk Type (Backing, Type and Index)
     - vDisk ID that was used to provision the volume.
     - Volume Name
     - Provisioned Size
     - Any additional tags found on the volume.
 .INPUTS
-    - Pure Storage Array FQDN or IP Address.
+    - Pure Storage Array(s) FQDN or IP Address.
     - Pure Storage Array Credential (Username and Password).
-    - Prism FQDN or IP Address.
-    - Prism Credential (Username and Password).
+    - Prism Central FQDN or IP Address.
+    - Prism CentralCredential (Username and Password).
     - (optional) VM Name to filter the results. If not provided, all tagged volumes will be returned.
+    - (optional) Cluster Name to filter the results. If not provided, all tagged volumes will be returned.
+
 .OUTPUTS
     Print out the on console the disk mapping results.
 .EXAMPLE
-    Option 1: Return all Volumes
-        ./GetVMVol.ps1 -ArrayEndpoint $FQDNorIPofArray -ArrayCredential $cred -PrismEndpoint $PrismFQDN -PrismCredential $prismCred
-    Option 2: Return specific VM's Volumes
+    Return all Volumes
+        ./GetVMVol.ps1 -ArrayEndpoint $FQDNorIPofArray1,$FQDNorIPofArray2 -ArrayCredential $cred -PrismEndpoint $PrismFQDN -PrismCredential $prismCred
+    Return specific VM's Volumes
         ./GetVMVol.ps1 -ArrayEndpoint $FQDNorIPofArray -ArrayCredential $cred -PrismEndpoint $PrismFQDN -PrismCredential $prismCred -VM "MyVM"
-    Option 3: Return specific VM's Volumes and Include Metadata Volumes
+    Return specific Cluster's Volumes
+        ./GetVMVol.ps1 -ArrayEndpoint $FQDNorIPofArray -ArrayCredential $cred -PrismEndpoint $PrismFQDN -PrismCredential $prismCred -Cluster "Cluster"
+    Return specific VM's Volumes and Include Metadata Volumes
         ./GetVMVol.ps1 -ArrayEndpoint $FQDNorIPofArray -ArrayCredential $cred -PrismEndpoint $PrismFQDN -PrismCredential $prismCred -VM "MyVM" -ShowMetadata $true
-    Option 4: Return specific VM's Volumes and Snapshots
+    Return specific VM's Volumes and Snapshots
         ./GetVMVol.ps1 -ArrayEndpoint $FQDNorIPofArray -ArrayCredential $cred -PrismEndpoint $PrismFQDN -PrismCredential $prismCred -VM "MyVM" -ShowSnapshots $true
 .CHANGELOG
     10/30/25 1.0.0 Initial version
     11/7/25  1.0.1 Added ShowMetadata, ShowSnapshots parameter
     11/13/25 1.0.2 Optimized with batch API calls and in-memory lookups to speed up resolution.
+    1/22/26  2.0.0 Use Nutanix API instead of PowerShell. Implemented Additional Volume Information and Multiple Array Support
 #>
 <#
 .DISCLAIMER
@@ -40,8 +46,8 @@ The author and the author's employer disclaim all express or implied warranties 
 #>
 [CmdletBinding()]
 param (
-    [Parameter(Mandatory = $true, HelpMessage = "Enter the Array FQDN/IP Address")]
-    [string]
+    [Parameter(Mandatory = $true, HelpMessage = "Enter one or more Array FQDN/IP Addresses (comma separated)")]
+    [string[]]
     $ArrayEndpoint,
 
     [Parameter(Mandatory = $true, HelpMessage = "Enter Array Credential")]
@@ -53,10 +59,14 @@ param (
     [string]
     $PrismEndpoint,
 
-    [Parameter(Mandatory = $true, HelpMessage = "Enter Prism Credential")]
+    [Parameter(Mandatory = $true, HelpMessage = "Enter Prism Central Credential")]
     [ValidateNotNullOrEmpty()]
     [PSCredential]
     $PrismCredential,
+
+    [Parameter(Mandatory = $false, HelpMessage = "Filter by Nutanix Cluster Name (Optional)")]
+    [string]
+    $Cluster,
 
     [Parameter(Mandatory = $false, HelpMessage = "Enter the VM Name (Optional)")]
     [string]
@@ -70,278 +80,451 @@ param (
     [string]
     $ShowSnapshots = $false
 )
+function Get-NutanixClusterExtId {
+    param (
+        [string]$PrismEndpoint,
+        [PSCredential]$PrismCredential,
+        [string]$Cluster
+    )
 
-# --- Import the Pure Storage PowerShell Module ---
-if (-not (Get-Module -Name PureStoragePowerShellSDK2 -ListAvailable)) {
-    Write-Error "PureStoragePowerShellSDK2 module is not installed. Please install it from the PowerShell Gallery."
-    exit
-}
+    $baseUrl = "https://${PrismEndpoint}:9440/api/clustermgmt/v4.2/config/clusters"
+    $user = $PrismCredential.UserName
+    $pass = $PrismCredential.GetNetworkCredential().Password
+    $pair = "${user}:${pass}"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($pair)
+    $base64 = [System.Convert]::ToBase64String($bytes)
+    $headers = @{ 'Authorization' = "Basic $base64" }
 
-if (-not (Get-Module -Name Nutanix.Cli -ListAvailable)) {
-    Write-Error "Nutanix.Cli module is not installed. Please install it from the PowerShell Gallery."
-    exit
-}
+    $filter = "?`$filter=name eq '$Cluster'&`$limit=1"
+    $uri = "${baseUrl}${filter}"
 
-# -- Import the module(s) ---
-Import-Module PureStoragePowerShellSDK2 | Out-Null
-Import-Module Nutanix.Cli | Out-Null
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ContentType "application/json" -SkipCertificateCheck -ErrorAction Stop
 
-# --- Attempt to connect to Prism ---
-try {
-    $Prism = Connect-PrismCentral -Server $PrismEndpoint -Credential $PrismCredential -AcceptInvalidSSLCerts -ForcedConnection
-}
-catch {
-    Write-Error "Failed to connect to Prism at $PrismEndpoint. $_"
-    exit
-}
-
-# --- Attempt to connect to the array ---
-try {
-    $array = Connect-Pfa2Array -Credential $ArrayCredential -Endpoint $ArrayEndpoint -IgnoreCertificateError
-}
-catch {
-    Write-Error "Failed to connect to array at $ArrayEndpoint. $_"
-    Disconnect-PrismCentral -Servers *
-    exit
-}
-
-# --- Retrieve tagged volumes and determine VM UUID(s) to process ---
-try {
-    # Get all Nutanix tags from the array (1 API Call)
-    $TaggedVolumes = Get-Pfa2VolumeTag -Namespaces 'nutanix-integration.nutanix.com' -Array $array -ErrorAction Stop
-
-    # --- Filter for owner_id tags only (in-memory) ---
-    $OwnerTags = $TaggedVolumes | Where-Object { $_.Key -eq 'owner_id' -and $_.Value }
-
-    $VMLookup = @{}
-    $TargetOwnerTags = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($VM)) {
-        # --- SCENARIO 1: Specific VM Name provided ---
-        $vm1 = Get-VM -Name $VM -ErrorAction SilentlyContinue
-        if (-not $vm1) {
-            Write-Error "VM with name '$VM' not found in Prism."
-            Disconnect-PrismCentral -Servers *
-            Disconnect-Pfa2Array -Array $array
-            exit
-        }
-        # Pre-populate the lookup table with our single VM
-        $VMLookup[$vm1.UUID] = $vm1.VMName
-        # Find only the tags matching this VM's UUID
-        $TargetOwnerTags = $OwnerTags | Where-Object { $_.Value -eq $vm1.UUID }
-    }
-    else {
-        # Get all unique UUIDs from the tags
-        $VM_UUIDs = $OwnerTags | Select-Object -ExpandProperty Value -Unique
-
-        if (-not $VM_UUIDs -or $VM_UUIDs.Count -eq 0) {
-            Write-Error "No VM UUIDs found in tags."
-            Disconnect-Pfa2Array -Array $array
-            Disconnect-PrismCentral -Servers *
-            exit
-        }
-        $AllPrismVMs = Get-VM
-
-        # Build the hashtable for fast lookups
-        foreach ($v in $AllPrismVMs) {
-            if (-not [string]::IsNullOrWhiteSpace($v.VMName)) {
-                $VMLookup[$v.UUID] = $v.VMName
-            }
-        }
-
-        # Add fallbacks for any tagged UUIDs not found in Prism
-        foreach ($uuid in $VM_UUIDs) {
-            if (-not $VMLookup.ContainsKey($uuid)) {
-                $VMLookup[$uuid] = $uuid # Use UUID as the name
-            }
-        }
-        # We are processing all tags we found
-        $TargetOwnerTags = $OwnerTags
-    }
-
-    if (-not $TargetOwnerTags) {
-        Write-Host "No volumes found with matching Nutanix tags."
-        Disconnect-Pfa2Array -Array $array
-        Disconnect-PrismCentral -Servers *
-        exit
-    }
-
-    # --- Build list of unique volumes to process from our target tags ---
-    $UniqueVolumeNames = $TargetOwnerTags |
-        Select-Object -ExpandProperty Resource |
-        Select-Object -ExpandProperty Name -Unique
-
-    $AllVolumes = Get-PFA2Volume -Array $array -ErrorAction SilentlyContinue
-
-    # Create a hashtable for instant lookups: $VolLookup['vol-name'] -> $volObject
-    $VolLookup = $AllVolumes | Group-Object -AsHashtable -Property Name
-
-    $results = foreach ($volName in $UniqueVolumeNames) {
-
-        # --- OPTIMIZATION: Use fast in-memory lookup instead of API call ---
-        if (-not $VolLookup.ContainsKey($volName)) {
-            Write-Warning "Volume '$volName' found in tags but not on the array. Skipping."
-            continue
-        }
-        # $VolLookup[$volName] returns an array (from Group-Object), so we take the first item [0]
-        $vol = $VolLookup[$volName][0]
-
-        # -- Skip metadata volumes unless user requested to show them ---
-        # Normalize $ShowMetadata to a boolean (accepts boolean or common string forms)
-        $showMeta = $false
-        if ($ShowMetadata -is [string]) {
-            $showMeta = ($ShowMetadata.Trim().ToLower() -in @('true','1','yes'))
+        if ($response.data -and $response.data.Count -gt 0) {
+            $c = $response.data[0]
+            if ($c.extId) { return $c.extId }
+            if ($c.ExtId) { return $c.ExtId }
+            throw "Cluster found but ExtId property is missing."
         }
         else {
-            try { $showMeta = [bool]$ShowMetadata } catch { $showMeta = $false }
+            throw "Cluster '$Cluster' not found."
         }
-
-        if (-not $showMeta -and $vol.Name -and $vol.Name.EndsWith('-md')) { continue }
-
-        $podName = if ($null -ne $vol.Pod) { $vol.Pod.name } else { $null }
-
-        # -- OPTIMIZATION 2: Filter existing tag data instead of new API call ---
-        $tags = $TaggedVolumes | Where-Object { $_.Resource.Name -eq $volName }
-
-        $props = [ordered]@{
-            PureVolume    = $vol.Name
-            DiskSize = if ($null -ne $vol.Space.UsedProvisioned) { [math]::Round($vol.Space.UsedProvisioned / 1GB, 2) } else { $null }
+    }
+    catch {
+        $errMessage = $_.Exception.Message
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $errBody = $reader.ReadToEnd()
+                Write-Warning "Cluster API Error: $errBody"
+            } catch {}
         }
+        throw "Failed to retrieve Cluster ID for '$Cluster': $errMessage"
+    }
+}
+function Get-NutanixVMs {
+    param (
+        [string]$PrismEndpoint,
+        [PSCredential]$PrismCredential,
+        [string]$FilterVMName,
+        [string]$ClusterFilterId
+    )
 
-        if ($tags) {
-            foreach ($t in $tags) {
-                # -- Skip volume_name tag as it's redundant ---
-                if ($t.Key -eq 'volume_name') { continue }
+    $baseUrl = "https://${PrismEndpoint}:9440/api/vmm/v4.2/ahv/config/vms"
 
-                # -- Map specific keys to desired property names ---
-                switch ($t.Key) {
-                    'owner_id'       {
-                        # Do NOT add VM_ID to output. Instead, map owner_id to VM using lookup.
-                        if ($t.Value) {
-                            if ($VMLookup.ContainsKey($t.Value)) {
-                                $props['VM'] = $VMLookup[$t.Value]
-                            }
-                            else {
-                                $props['VM'] = $t.Value
-                            }
-                        }
-                        continue
+    $user = $PrismCredential.UserName
+    $pass = $PrismCredential.GetNetworkCredential().Password
+    $pair = "${user}:${pass}"
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($pair)
+    $base64 = [System.Convert]::ToBase64String($bytes)
+    $headers = @{ 'Authorization' = "Basic $base64" }
+
+    function Fetch-VMs {
+        param ([string]$ODataFilter)
+        $collected = @()
+        $page = 0
+        $limit = 50 
+        $totalFetched = 0
+        $grandTotal = -1
+        $sortParam = "&`$orderby=name" 
+
+        do {
+            $uri = "${baseUrl}?`$page=${page}&`$limit=${limit}${ODataFilter}${sortParam}"
+            $response = Invoke-RestMethod -Uri $uri -Method Get -Headers $headers -ContentType "application/json" -SkipCertificateCheck -ErrorAction Stop
+            $batchCount = 0
+
+            if ($response.data) {
+                $batch = @($response.data)
+                $batchCount = $batch.Count
+
+                if ($response.metadata -and $response.metadata.totalAvailableResults) {
+                    $grandTotal = $response.metadata.totalAvailableResults
+                }
+
+                foreach ($vm in $batch) {
+                    if (-not [string]::IsNullOrWhiteSpace($ClusterFilterId)) {
+                        $vmClusterId = $null
+                        if ($vm.cluster.extId) { $vmClusterId = $vm.cluster.extId }
+                        elseif ($vm.cluster.ExtId) { $vmClusterId = $vm.cluster.ExtId }
+                        elseif ($vm.Cluster.extId) { $vmClusterId = $vm.Cluster.extId }
+                        elseif ($vm.Cluster.ExtId) { $vmClusterId = $vm.Cluster.ExtId }
+                        elseif ($vm.clusterReference.extId) { $vmClusterId = $vm.clusterReference.extId }
+                        elseif ($vm.clusterReference.ExtId) { $vmClusterId = $vm.clusterReference.ExtId }
+                        elseif ($vm.ClusterReference.extId) { $vmClusterId = $vm.ClusterReference.extId }
+                        elseif ($vm.ClusterReference.ExtId) { $vmClusterId = $vm.ClusterReference.ExtId }
+
+                        if ($vmClusterId -ne $ClusterFilterId) { continue }
                     }
-                    'owner_disk_id'  { $propName = 'vDisk' ; break }
-                    default          { $propName = ($t.Key -replace '\s','_') }
-                }
-
-                # -- Add tag to properties if mapped to a property name ---
-                if ($propName) {
-                    $props[$propName] = $t.Value
+                    $collected += $vm
                 }
             }
-        }
 
-        [PSCustomObject]$props
+            $totalFetched += $batchCount
+
+            if ($grandTotal -ge 0 -and $totalFetched -ge $grandTotal) { break }
+            if ($batchCount -eq 0) { break }
+
+            $page++
+        } while ($true)
+
+        return $collected
     }
 
-    # --- Final Formatting and Output ---
-    $results = @($results)
+    if (-not [string]::IsNullOrWhiteSpace($FilterVMName)) {
+        Write-Verbose "Attempting Exact Match for VM '$FilterVMName'..."
+        $serverFilter = "&`$filter=name eq '$FilterVMName'"
 
-    $tagKeys = $results |
-        ForEach-Object { $_.PSObject.Properties.Name } |
-        Select-Object -Unique |
-        Where-Object { $_ -notin 'PureVolume','DiskSize','volume_name' }
-
-    # Ensure VM appears to the left in the output
-    $orderedTagKeys = @()
-    if ($tagKeys -contains 'VM') {
-        $orderedTagKeys += 'VM'
-        $tagKeys = $tagKeys | Where-Object { $_ -ne 'VM' }
-    }
-    # append remaining tag keys (including VDisk_ID or others)
-    $orderedTagKeys += ($tagKeys | Sort-Object)
-
-    $columns = $orderedTagKeys + @('PureVolume','DiskSize')
-
-    # --- Format, Sort and Display the Results ---
-    $results | Sort-Object VM, PureVolume | Format-Table -Property $columns -AutoSize
-
-    # Snapshots (run only if requested)
-    # Normalize $ShowSnapshots to a boolean
-    $showSnaps = $false
-    if ($ShowSnapshots -is [string]) {
-        $showSnaps = ($ShowSnapshots.Trim().ToLower() -in @('true','1','yes'))
-    }
-    else {
-        try { $showSnaps = [bool]$ShowSnapshots } catch { $showSnaps = $false }
-    }
-
-    if ($showSnaps) {
         try {
-            # Determine which volumes to get snapshots for
-            $vmVolumes = @()
-            if (-not [string]::IsNullOrWhiteSpace($VM)) {
-                # Specific VM was requested, so only get snaps for that VM's volumes
-                $vmVolumes = $results | Where-Object { $_.VM -eq $VM } | Select-Object -ExpandProperty PureVolume -Unique
-            } else {
-                # All VMs, so get snaps for all volumes found in the results
-                $vmVolumes = $results | Select-Object -ExpandProperty PureVolume -Unique
-            }
+            $results = Fetch-VMs -ODataFilter $serverFilter
+            if ($results.Count -gt 0) { return $results }
+            Write-Verbose "Exact match not found. Switching to Full Scan..."
+        }
+        catch { Write-Warning "Server filter failed. Retrying with Full Scan." }
+    }
 
-            $AllSnaps = Get-Pfa2VolumeSnapshot -Array $array -ErrorAction SilentlyContinue
+    $allVMs = Fetch-VMs -ODataFilter ""
 
-            $SnapLookup = @{}
-            if ($AllSnaps) {
-                # Group snapshots by their source volume name (if it exists)
-                $SnapLookup = $AllSnaps | Where-Object { $_.Source.Name } | Group-Object -AsHashtable -Property { $_.Source.Name }
-            } else {
-                Write-Host "No snapshots found on array."
-            }
+    if (-not [string]::IsNullOrWhiteSpace($FilterVMName)) {
+        return $allVMs | Where-Object { $_.name -eq $FilterVMName }
+    }
 
-            foreach ($vol in $vmVolumes) {
-                Write-Host ""
-                Write-Host ("Snapshots for Volume: {0}" -f $vol) -ForegroundColor Cyan
+    return $allVMs
+}
 
-                $volSnaps = @()
+if (-not (Get-Module -Name PureStoragePowerShellSDK2 -ListAvailable)) {
+    Write-Error "PureStoragePowerShellSDK2 module is not installed."
+    exit
+}
 
-                # 1. Check the primary lookup (fastest, most reliable)
-                if ($SnapLookup.ContainsKey($vol)) {
-                    $volSnaps += $SnapLookup[$vol]
-                }
+Import-Module PureStoragePowerShellSDK2 | Out-Null
 
-                # 2. Fallback: name prefix match (for snaps without a source.name)
-                $volSnaps += $AllSnaps | Where-Object { $_.Name -like "$vol.*" -and (-not $_.Source.Name) }
+if ([System.Net.ServicePointManager]::ServerCertificateValidationCallback -eq $null) {
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+}
 
-                if (-not $volSnaps) {
-                    Write-Host "  (no snapshots found)"
-                    continue
-                }
+if ($ArrayEndpoint.Count -eq 1 -and $ArrayEndpoint[0] -match ',') {
+    $ArrayEndpoint = $ArrayEndpoint[0] -split ',' | ForEach-Object { $_.Trim() }
+}
+$ArrayEndpoint = $ArrayEndpoint | Select-Object -Unique
 
-                $volSnaps | Select-Object -Unique | # Add Unique just in case of overlap
-                    Select-Object @{
-                            Name  = 'VolumeName';   Expression = { $vol }
-                        }, @{
-                            Name  = 'SnapshotName'; Expression = { $_.Name }
-                        }, @{
-                            Name  = 'Created';      Expression = {
-                                if ($_.Created)         { $_.Created }
-                                elseif ($_.TimeCreated) { $_.TimeCreated }
-                                elseif ($_.creation_time){ $_.creation_time }
-                                elseif ($_.Time)        { $_.Time }
-                                else { $null }
-                            }
-                        } |
-                    Sort-Object Created | # Added sorting for readability
-                    Format-Table -AutoSize
-            }
+try {
+    $targetClusterId = $null
+    if (-not [string]::IsNullOrWhiteSpace($Cluster)) {
+        Write-Host "Resolving Cluster ID for '$Cluster'..." -ForegroundColor Cyan
+        try {
+            $targetClusterId = Get-NutanixClusterExtId -PrismEndpoint $PrismEndpoint -PrismCredential $PrismCredential -Cluster $Cluster
         }
         catch {
-            Write-Warning "Failed to retrieve snapshots for one or more volumes: $($_.Exception.Message)"
+            Write-Error $_
+            exit
         }
     }
-    # --- Disconnect from Array ---
-    Disconnect-Pfa2Array -Array $array
 
-    # --- Disconnect from Prism ---
-    Disconnect-PrismCentral -Servers *
+    $VMLookup = @{}
+    Write-Host "Retrieving VM information from Nutanix Prism $PrismEndpoint..." -ForegroundColor Cyan
+
+    $prismVMs = Get-NutanixVMs -PrismEndpoint $PrismEndpoint -PrismCredential $PrismCredential -FilterVMName $VM -ClusterFilterId $targetClusterId
+
+    if (-not $prismVMs) {
+        if ($VM) { Write-Error "VM '$VM' not found." }
+        else { Write-Warning "No VMs returned from Prism (check cluster/permissions)." }
+        if ($VM) { exit }
+    }
+
+    if ($prismVMs) {
+        foreach ($v in $prismVMs) { 
+            if ($v.extId) { $VMLookup[$v.extId] = $v }
+            if ($v.biosUuid) { $VMLookup[$v.biosUuid] = $v }
+            elseif ($v.BiosUuid) { $VMLookup[$v.BiosUuid] = $v }
+        }
+    }
 }
 catch {
-    Write-Error "An error occurred during data retrieval: $_.Exception.Message"
+    Write-Error "Error fetching Nutanix Data: $_"
+    exit
+}
+
+foreach ($currentArrayEndpoint in $ArrayEndpoint) {
+    Write-Host "`n--- Processing Array: $currentArrayEndpoint ---" -ForegroundColor Cyan
+
+    $array = $null
+    $results = $null
+    $matchFoundOnThisArray = $false
+
+    try {
+        $array = Connect-Pfa2Array -Credential $ArrayCredential -Endpoint $currentArrayEndpoint -IgnoreCertificateError -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "FAILED to connect to array [$currentArrayEndpoint]"
+        Write-Warning "Reason: $($_.Exception.Message)"
+        continue
+    }
+
+    try {
+        $OwnerTags = @()
+        $namespace = 'nutanix-integration.nutanix.com'
+
+        if (-not [string]::IsNullOrWhiteSpace($VM) -and $VMLookup.Count -gt 0) {
+            Write-Host "  Performing targeted tag search for VM '$VM'..." -ForegroundColor Green
+            foreach ($uuid in $VMLookup.Keys) {
+                $filterStr = "key='owner_id' and value='$uuid'"
+                $found = Get-Pfa2VolumeTag -Namespaces $namespace -Array $array -Filter $filterStr -ErrorAction SilentlyContinue
+                if ($found) { $OwnerTags += $found }
+            }
+        }
+        else {
+            $bulkFilter = "key='owner_id'"
+            $OwnerTags = Get-Pfa2VolumeTag -Namespaces $namespace -Array $array -Filter $bulkFilter -ErrorAction Stop
+        }
+
+        if (-not $OwnerTags) {
+            Write-Host "  No matching volumes found on $currentArrayEndpoint."
+            continue
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($VM)) {
+            $foundUUIDs = $VMLookup.Keys
+            $OwnerTags = $OwnerTags | Where-Object { $_.Value -in $foundUUIDs }
+        }
+
+        elseif (-not [string]::IsNullOrWhiteSpace($Cluster)) {
+            $foundUUIDs = $VMLookup.Keys
+            $OwnerTags = $OwnerTags | Where-Object { $_.Value -in $foundUUIDs }
+        }
+
+        if (-not $OwnerTags) {
+            Write-Host "  No matches found on this array (after filtering)."
+            continue
+        }
+
+        $UniqueVolumeNames = $OwnerTags | Select-Object -ExpandProperty Resource | Select-Object -ExpandProperty Name -Unique
+
+        Write-Host "  Found $($UniqueVolumeNames.Count) volume matches. This may take awhile..." -ForegroundColor Gray
+
+        $FullTagSet = @()
+
+        if ($UniqueVolumeNames.Count -gt 100) {
+            $FullTagSet = Get-Pfa2VolumeTag -Namespaces $namespace -Array $array
+        }
+        else {
+            foreach ($vName in $UniqueVolumeNames) {
+                $vTags = Get-Pfa2VolumeTag -Namespaces $namespace -Array $array -ResourceNames $vName
+                $FullTagSet += $vTags
+            }
+        }
+
+        $AllVolumes = Get-PFA2Volume -Array $array -ErrorAction SilentlyContinue
+        $VolLookup = $AllVolumes | Group-Object -AsHashtable -Property Name
+
+        $results = foreach ($volName in $UniqueVolumeNames) {
+            if (-not $VolLookup.ContainsKey($volName)) { continue }
+            $vol = $VolLookup[$volName][0]
+
+            $showMeta = $false
+            if ($ShowMetadata -is [string]) { $showMeta = ($ShowMetadata.Trim().ToLower() -in @('true','1','yes')) }
+            else { try { $showMeta = [bool]$ShowMetadata } catch { $showMeta = $false } }
+            if (-not $showMeta -and $vol.Name -and $vol.Name.EndsWith('-md')) { continue }
+
+            $tags = $FullTagSet | Where-Object { $_.Resource.Name -eq $volName }
+
+            $props = [ordered]@{
+                Array       = $currentArrayEndpoint
+                VM          = "Unknown"
+                PureVolume  = $vol.Name
+                BusType     = $null
+                Index       = $null
+                BackingType = $null
+                vDisk       = $null
+                DiskSize    = if ($null -ne $vol.Space.UsedProvisioned) { [math]::Round($vol.Space.UsedProvisioned / 1GB, 2) } else { $null }
+            }
+
+            if ($tags) {
+                foreach ($t in $tags) {
+                    if ($t.Key -eq 'volume_name') { continue }
+                    switch ($t.Key) {
+                        'owner_id' {
+                            if ($t.Value -and $VMLookup.ContainsKey($t.Value)) {
+                                $props['VM'] = $VMLookup[$t.Value].name
+                                $vmObj = $VMLookup[$t.Value]
+                            } elseif ($t.Value) {
+                                $props['VM'] = $t.Value 
+                            }
+                            continue
+                        }
+                        'owner_disk_id' { $props['vDisk'] = $t.Value; continue }
+                        default { $propName = ($t.Key -replace '\s','_'); if($propName){ $props[$propName] = $t.Value } }
+                    }
+                }
+            }
+
+            if ($vmObj -and $props['vDisk']) {
+                $matchFound = $false
+
+                if ($vmObj.Disks) {
+                    foreach ($disk in $vmObj.Disks) {
+                        if ($disk.extId -eq $props['vDisk']) {
+                            $matchFound = $true
+                            if ($disk.DiskAddress) {
+                                $props['BusType'] = $disk.DiskAddress.busType
+                                $props['Index']   = $disk.DiskAddress.index
+                            }
+                            if ($disk.BackingInfo) {
+                                $rawType = $disk.BackingInfo.'$objectType'
+                                if ($rawType) { $props['BackingType'] = $rawType -replace '^.*\.config\.', '' }
+                            }
+                            break
+                        }
+                    }
+                }
+
+                if (-not $matchFound -and $vmObj.CdRoms) {
+                    foreach ($cdrom in $vmObj.CdRoms) {
+                        if ($cdrom.extId -eq $props['vDisk']) {
+                            $matchFound = $true
+                            if ($cdrom.DiskAddress) {
+                                $props['BusType'] = $cdrom.DiskAddress.busType
+                                $props['Index']   = $cdrom.DiskAddress.index
+                            }
+                            $rawType = $cdrom.'$objectType'
+                            if ($rawType) { $props['BackingType'] = $rawType -replace '^.*\.config\.', '' }
+                            else { $props['BackingType'] = "CdRom" }
+                            break
+                        }
+                    }
+                }
+
+                if (-not $matchFound -and $vmObj.vtpmConfig -and $vmObj.vtpmConfig.vtpmDevice) {
+                    $vtpm = $vmObj.vtpmConfig.vtpmDevice
+                    if ($vtpm.diskExtId -eq $props['vDisk']) {
+                        $matchFound = $true
+                        $props['BusType'] = "TPM" 
+                        $props['Index']   = ""
+                        $rawType = $vtpm.'$objectType'
+                        if ($rawType) { $props['BackingType'] = $rawType -replace '^.*\.config\.', '' }
+                        else { $props['BackingType'] = "VtpmDevice" }
+                    }
+                }
+
+                if (-not $matchFound -and $vmObj.bootConfig) {
+                    $nvram = $null
+                    if ($vmObj.bootConfig.nvramDevice) { $nvram = $vmObj.bootConfig.nvramDevice }
+                    elseif ($vmObj.bootConfig.uefiBoot -and $vmObj.bootConfig.uefiBoot.nvramDevice) { $nvram = $vmObj.bootConfig.uefiBoot.nvramDevice }
+
+                    if ($nvram) {
+                        $nvramDiskId = $null
+                        if ($nvram.backingStorageInfo -and $nvram.backingStorageInfo.diskExtId) {
+                            $nvramDiskId = $nvram.backingStorageInfo.diskExtId
+                        }
+                        if ($nvramDiskId -eq $props['vDisk']) {
+                            $matchFound = $true
+                            $props['BusType']     = "UEFI"
+                            $props['Index']       = ""
+                            $props['BackingType'] = "UefiDisk"
+                        }
+                    }
+                }
+            }
+            $vmObj = $null
+
+            [PSCustomObject]$props
+        }
+
+        if ($results) {
+            $matchFoundOnThisArray = $true
+            $standardCols = @('VM','BusType','Index','BackingType','vDisk','PureVolume','DiskSize')
+            $allProps = $results | ForEach-Object { $_.PSObject.Properties.Name } | Select-Object -Unique
+            $extraTags = $allProps | Where-Object { $_ -notin $standardCols -and $_ -ne 'volume_name' } | Sort-Object
+            $columns = $standardCols + $extraTags
+
+            $results | Sort-Object VM, BusType, Index, PureVolume | Format-Table -Property $columns -AutoSize
+        }
+        else {
+            Write-Host "  No results matching criteria on this array."
+        }
+
+        $showSnaps = $false
+        if ($ShowSnapshots -is [string]) { $showSnaps = ($ShowSnapshots.Trim().ToLower() -in @('true','1','yes')) }
+        else { try { $showSnaps = [bool]$ShowSnapshots } catch { $showSnaps = $false } }
+
+        if ($showSnaps -and $results) {
+            try {
+                $vmVolumes = @()
+                if (-not [string]::IsNullOrWhiteSpace($VM)) {
+                    $vmVolumes = $results | Where-Object { $_.VM -eq $VM } | Select-Object -ExpandProperty PureVolume -Unique
+                } else {
+                    $vmVolumes = $results | Select-Object -ExpandProperty PureVolume -Unique
+                }
+
+                if ($vmVolumes) {
+                    Write-Host "  Retrieving snapshots..." -ForegroundColor Cyan
+                    $AllSnaps = Get-Pfa2VolumeSnapshot -Array $array -ErrorAction SilentlyContinue
+
+                    $SnapLookup = @{}
+                    if ($AllSnaps) {
+                        $SnapLookup = $AllSnaps | Where-Object { $_.Source.Name } | Group-Object -AsHashtable -Property { $_.Source.Name }
+                    }
+
+                    foreach ($vol in $vmVolumes) {
+                        Write-Host ""
+                        Write-Host ("  Snapshots for Volume: {0}" -f $vol) -ForegroundColor Cyan
+
+                        $volSnaps = @()
+                        if ($SnapLookup.ContainsKey($vol)) { $volSnaps += $SnapLookup[$vol] }
+                        $volSnaps += $AllSnaps | Where-Object { $_.Name -like "$vol.*" -and (-not $_.Source.Name) }
+
+                        if (-not $volSnaps) {
+                            Write-Host "    (no snapshots found)"
+                            continue
+                        }
+
+                        $volSnaps | Select-Object -Unique |
+                            Select-Object @{ Name = 'VolumeName'; Expression = { $vol } }, @{ Name = 'SnapshotName'; Expression = { $_.Name } }, @{ Name = 'Created'; Expression = { if ($_.Created) { $_.Created } elseif ($_.TimeCreated) { $_.TimeCreated } elseif ($_.creation_time){ $_.creation_time } elseif ($_.Time) { $_.Time } else { $null } } } |
+                            Sort-Object Created | Format-Table -AutoSize
+                    }
+                }
+            }
+            catch {
+                Write-Warning "Failed to retrieve snapshots: $($_.Exception.Message)"
+            }
+        }
+    }
+    catch {
+        Write-Error "Error processing array $currentArrayEndpoint : $_"
+    }
+    finally {
+        if ($array) {
+            Disconnect-Pfa2Array -Array $array -ErrorAction SilentlyContinue 
+        }
+    }
+
+    if ($matchFoundOnThisArray) {
+        if (-not [string]::IsNullOrWhiteSpace($VM)) {
+            Write-Host "  Target VM '$VM' found on this array. Stopping search." -ForegroundColor Green
+            break
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Cluster)) {
+            break
+        }
+    }
 }
