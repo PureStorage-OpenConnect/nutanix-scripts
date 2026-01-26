@@ -6,7 +6,7 @@ Follow the below step to collect Azure VM data disk information.
 2. Configure Array Credentials - `$arraycred = Get-Credential`
 3. Using Powershell, run the following command(s)
 
-4. Execute the script. 
+4. Execute the script.
 
 ```powershell
 ./GetVMVol.ps1 -ArrayEndpoint $ArrayEndpoint -PrismEndpoint $PrismEndpoint -ArrayCredential $arraycred -PrismCredential $prismcred
@@ -18,9 +18,9 @@ Follow the below step to collect Azure VM data disk information.
 
 `-VM <VMNAME>` (OPTIONAL) - To Show Specific VM's Details
 
-`-showSnapshots $true` (OPTIONAL) - To Show VM's Snapshots
+`-showSnapshots` (OPTIONAL) - To Show VM's Snapshots
 
-`-showMetadata $true` (OPTIONAL) - Show VM's Metadata Disks
+`-showMetadata` (OPTIONAL) - Show VM's Metadata Disks
 
 ## Examples
 
