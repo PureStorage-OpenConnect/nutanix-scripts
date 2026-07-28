@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: portworx-node-prep
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: portworx-node-prep
+  template:
+    metadata:
+      labels:
+        app: portworx-node-prep
+    spec:
+      hostPID: true
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: prep-script
+        image: rockylinux:9
+        securityContext:
+          privileged: true
+        command: ["nsenter", "-t", "1", "-m", "-u", "-n", "-i", "-p", "bash", "-c"]
+        args:
+          - |
+            # Check if GRUB is already updated to prevent looping
+            if grep -q "nvme_core.multipath=N" /etc/default/grub; then
+              echo "Node already prepped for Portworx. Sleeping forever."
+              sleep infinity
+            fi
+            
+            echo "Installing Pure dependencies..."
+            dnf install -y nvme-cli device-mapper-multipath kpartx util-linux
+            
+            echo "Writing multipath.conf..."
+            cat << 'EOF' > /etc/multipath.conf
+            blacklist {
+                devnode "^pxd[0-9]*"
+                devnode "^pxd*"
+                device {
+                  vendor "VMware"
+                  product "Virtual disk"
+                }
+            }
+            defaults {
+                polling_interval 10
+                find_multipaths yes
+                user_friendly_names no
+            }
+            devices {
+                device {
+                    vendor                      "NVME"
+                    product                     "Everpure FlashArray"
+                    path_selector               "queue-length 0"
+                    path_grouping_policy        group_by_prio
+                    prio                        ana
+                    failback                    immediate
+                    fast_io_fail_tmo            10
+                    user_friendly_names         no
+                    no_path_retry               0
+                    features                    0
+                    dev_loss_tmo                60
+                }
+                device {
+                    vendor                   "PURE"
+                    product                  "FlashArray"
+                    path_selector            "service-time 0"
+                    hardware_handler         "1 alua"
+                    path_grouping_policy     group_by_prio
+                    prio                     alua
+                    failback                 immediate
+                    path_checker             tur
+                    fast_io_fail_tmo         10
+                    user_friendly_names      no
+                    no_path_retry            0
+                    features                 0
+                    dev_loss_tmo             600
+                }
+            }
+            EOF
+            
+            echo "Unloading and reloading NVMe modules..."
+            rmmod nvme_tcp nvme_fabrics nvme_core || true
+            modprobe nvme_core multipath=N
+            modprobe nvme_fabrics || true
+            modprobe nvme_tcp || true
+            modprobe dm_multipath || true
+            
+            echo "Updating GRUB so settings persist across node reboots..."
+            grubby --update-kernel=ALL --args="nvme_core.multipath=N"
+            
+            echo "Restarting multipathd..."
+            systemctl enable --now multipathd
+            systemctl restart multipathd
+            
+            echo "Prep complete! Node is ready for Portworx."
+            sleep infinity
