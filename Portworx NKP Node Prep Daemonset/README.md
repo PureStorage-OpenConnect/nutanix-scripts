@@ -52,6 +52,5 @@ systemctl status multipathd
 
 ## Notes
 
-- **Requires a node reboot** to fully apply the `nvme_core.multipath=N` GRUB setting at boot; the script reloads kernel modules live, but a reboot ensures the setting takes effect from boot going forward.
 - Runs as a privileged container with `hostPID`, `hostNetwork`, and full namespace access (`nsenter -m -u -n -i -p`) since it needs to modify the host OS directly.
 - Review and adjust `/etc/multipath.conf` device settings before use in production if your FlashArray configuration differs.
